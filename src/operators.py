@@ -113,8 +113,9 @@ class ModelSpace:
         ith molecule
         """
         if self.common_bath:
-            i = 0
-        return self._ann_ops(idx=1+self.dim_vib+k*self.num_phonons+i)
+            return self._ann_ops(idx=1+self.dim_vib+k)
+        else:
+            return self._ann_ops(idx=1+self.dim_vib+k*self.n+i)
 
     def cre_b(self, k, i=0):
         """Creator operator for the kth phonon mode associated with the ith
@@ -126,7 +127,7 @@ class ModelSpace:
 class HamiltonianSystem:
     def __init__(
             self, ms, omega_c, omega_m, g, lambda_k, omega_k, Omega_p,
-            kappa, S_func, gamma_e=None, gamma_a=None, Gamma_e=None,
+            omega_d, kappa, S_func, gamma_e=None, gamma_a=None, Gamma_e=None,
             Gamma_a=None, gamma_phi=None,
     ):
         """
@@ -168,6 +169,7 @@ class HamiltonianSystem:
         self.omega_c = omega_c
         self.omega_m = omega_m
         self.omega_k = omega_k
+        self.omega_d = omega_d
         self.Omega_p = Omega_p
 
         # Coupling coefficients
@@ -195,7 +197,7 @@ class HamiltonianSystem:
     def _bright(self):
         b = 0
         for i in range(self.ms.n):
-            b += self.ms.creator_c(i) * self.ms.vac
+            b += self._c(i) * self.VAC
         return b / sqrt(self.ms.n)
 
     def _u_m_i(self, m, i):
@@ -208,7 +210,7 @@ class HamiltonianSystem:
             di1 = self.ms.zero() * self.VAC
             for m in range(self.N):
                 umi = self._u_m_i(m, i)
-                di1 += umi * self._b(m).dag() * self.VAC
+                di1 += umi * self._c(m).dag() * self.VAC
             yield di1
 
     def _dark_states(self):
@@ -251,7 +253,8 @@ class HamiltonianSystem:
     def h_d(self):
         """Driving Hamiltonian
         """
-        return self.Omega_p * (self._a + self._a.dag())
+        a = self._a
+        return self.Omega_p * (a + a.dag()) - self.omega_d * a.dag() * a
 
     def _h_b_com(self):
         hb = 0
