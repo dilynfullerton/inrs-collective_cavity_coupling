@@ -1,6 +1,51 @@
 from numpy import sqrt, pi, exp
 from qutip import *
-from itertools import product
+from collections import deque
+
+
+def orthogonalize(states, zero_op):
+    """Given a sequence of states, returns a generator of mutually
+    orthogonal states generating span(states).
+    The number of returned states will be of the same size, containing
+    zeros if |states| > dim(span(states)).
+    """
+    psf = zero_op
+    states = deque(states)
+    while len(states) > 0:
+        s = states.pop()
+        s -= psf * s
+        psf += orthonormal_projection(s, zero_op=zero_op)
+        yield s
+
+
+def orthonormal_basis(states, zero_op):
+    """Given a sequence of states, returns a generator of an orthonormal
+    basis, generating span(states)
+    """
+    for s in orthogonalize(states, zero_op=zero_op):
+        if s.norm() > 0:
+            yield s.unit()
+
+
+def orthonormal_projection(states, zero_op):
+    if isinstance(states, Qobj):
+        states = [states]
+    return _orthonormal_projection(states=deque(states), zero_op=zero_op)
+
+
+def _orthonormal_projection(states, zero_op, p_rest=None):
+    if len(states) == 0:
+        return zero_op
+    elif len(states) == 1:
+        s = states.pop()
+        if s.norm() > 0:
+            s = s.unit()
+        return s * s.dag()
+    else:
+        s = states.pop()
+        if p_rest is None:
+            p_rest = _orthonormal_projection(states, zero_op=zero_op)
+        return orthonormal_projection(s - p_rest * s, zero_op=zero_op) + p_rest
 
 
 def _super_commutator(a_op, b_op):
@@ -10,109 +55,79 @@ def _super_commutator(a_op, b_op):
     return sprepost(a_op, b_op) - spre(b_op * a_op)
 
 
+def _outer_product(v1, v2=None):
+    if v2 is None:
+        v2 = v1
+    return v1 * v2.dag()
+
+
 class ModelSpace:
-    def __init__(self, num_molecules, num_phonons, common_bath):
+    def __init__(self, num_molecules, num_phonon_modes, common_bath):
         self.n = num_molecules
-        self.num_phonons = num_phonons
+        self.num_phonons = num_phonon_modes
         self.common_bath = common_bath
-        self._dim_c = 1
-        self._dim_m = self.n
+        self.dim_vib = self.n
         if self.common_bath:
-            self._dim_b = self.num_phonons
+            self.dim_bath = self.num_phonons
         else:
-            self._dim_b = self.num_phonons * self.n
-        self.dim = self._dim_c + self._dim_b + self._dim_m
+            self.dim_bath = self.num_phonons * self.n
+        self.dim = 1 + self.dim_vib + self.dim_bath
 
-        self.vac = tensor([basis(2)] * self.dim)  # vacuum state
+    def vac(self):
+        return tensor([fock_dm(2)] * self.dim)
 
-        self.zero = qzero([2] * self.dim)  # zero operator
-        self.one = qeye([2] * self.dim)  # identity operator
+    def zero(self):
+        return qzero([2] * self.dim)
 
-        # Creation and annihilation operators for cavity, labeled a
-        self.annihilator_a = tensor(
-            destroy(2),
-            qeye([2] * self._dim_m),
-            qeye([2] * self._dim_b)
+    def one(self):
+        return qeye([2] * self.dim)
+
+    def ann_a(self):
+        return tensor(
+            [destroy(2)] +
+            [qeye(2)] * self.dim_vib +
+            [qeye(2)] * self.dim_bath
         )
-        self.creator_a = self.annihilator_a.dag()
 
-    def annihilator_c(self, i):
+    def cre_a(self):
+        return self.ann_a().dag()
+
+    def _ann_ops(self, idx):
+        one = [qeye(2)] * self.dim
+        one.insert(idx, destroy(2))
+        one.pop(idx+1)
+        return tensor(one)
+
+    def ann_c(self, i):
         """Annihilator operator for ith molecule state
         """
-        idx = self._dim_c + i
-        ops = [qeye(2)] * self.dim
-        ops.insert(idx, destroy(2))
-        ops.pop(idx+1)
-        return tensor(ops)
+        return self._ann_ops(idx=1+i)
 
-    def creator_c(self, i):
+    def cre_c(self, i):
         """Creator operator for ith molecule state
         """
-        return self.annihilator_c(i).dag()
+        return self.ann_c(i).dag()
 
-    def total_annihilator_c(self):
-        op = 0
-        for i in range(self._dim_m):
-            op += self.annihilator_c(i)
-        return op
-
-    def total_creator_c(self):
-        return self.total_annihilator_c().dag()
-
-    def annihilator_b(self, k, i=0):
+    def ann_b(self, k, i=0):
         """Annihilator operator for kth phonon mode associated with the
         ith molecule
         """
         if self.common_bath:
             i = 0
-        idx = self._dim_c + self._dim_m + i * self._dim_b + k
-        ops = [qeye(2)] * self.dim
-        ops.insert(idx, destroy(2))
-        ops.pop(idx+1)
-        return tensor(ops)
+        return self._ann_ops(idx=1+self.dim_vib+k*self.num_phonons+i)
 
-    def total_annihilator_b(self, k):
-        if self.common_bath:
-            return self.annihilator_b(k=k)
-        else:
-            op = 0
-            for i in range(self._dim_m):
-                op += self.annihilator_b(k=k, i=i)
-            return op
-
-    def total_creator_b(self, k):
-        return self.total_annihilator_b(k=k).dag()
-
-    def creator_b(self, k, i=0):
+    def cre_b(self, k, i=0):
         """Creator operator for the kth phonon mode associated with the ith
         molecule state
         """
-        return self.annihilator_b(k, i).dag()
-
-    def sigma(self, v1, v2):
-        """Returns the operator |v1><v2|
-        """
-        return v1 * v2.dag()
-
-    def proj(self, vectors):
-        """Returns the operator which projects onto span(vectors) with the
-        regular Euclidean projection. The vectors given must be mutually
-        orthonormal.
-        :param vectors: A sequence of orthonormal (qutip) vectors
-        :return: A qutip operator, which projects onto span(vectors)
-        """
-        p = 0
-        for v in vectors:
-            p += self.sigma(v, v)
-        return p
+        return self.ann_b(k=k, i=i).dag()
 
 
 class HamiltonianSystem:
     def __init__(
             self, ms, omega_c, omega_m, g, lambda_k, omega_k, Omega_p,
-            temperature, omega_cut, eta, kappa,
-            omega_d=0, gamma_e=None, gamma_a=None,
-            Gamma_e=None, Gamma_a=None, gamma_phi=None,
+            kappa, S_func, gamma_e=None, gamma_a=None, Gamma_e=None,
+            Gamma_a=None, gamma_phi=None,
     ):
         """
         If any of the term gamma_e, gamma_a, Gamma_e, Gamma_a, or gamma_phi
@@ -129,9 +144,6 @@ class HamiltonianSystem:
         one for each phonon mode k
         :param omega_k: Array of phonon mode frequencies for phonon modes
         the the bath
-        :param temperature: Bath temperature * k_B
-        :param omega_cut: Cutoff frequency for system-bath coupling
-        :param omega_d: Driving frequency
         :param gamma_e: Polariton-polariton connection
         :param gamma_a: Polariton-polariton connection
         :param Gamma_e: Polariton-dark connection
@@ -139,67 +151,46 @@ class HamiltonianSystem:
         :param gamma_phi: Bare molecule dephasing
         """
         self.ms = ms
-        self._omega_cut = omega_cut
-        self._beta = 1 / temperature
-        self._eta = eta
-        self._kappa = kappa
+        self.N = self.ms.n
+        self.Np = self.ms.num_phonons
+        self.kappa = kappa
+
+        self._S_func = S_func
+
+        # Operators
+        self._a = self.ms.ann_a()
+        self._c = self.ms.ann_c
+        self._b = self.ms.ann_b
+        self._one = self.ms.one()
+        self._zero = self.ms.zero()
 
         # Frequencies
         self.omega_c = omega_c
         self.omega_m = omega_m
         self.omega_k = omega_k
-        self.lambda_k = lambda_k
-        self.g = g
         self.Omega_p = Omega_p
 
-        # Adjust frequencies for to driving frequency
-        self.omega_d = omega_d
+        # Coupling coefficients
+        self.lambda_k = lambda_k
+        self.g = g
 
         # Gamma values from secular approximation
         self.Omega_R = 2 * sqrt(self.ms.n) * self.g
-        self.gamma_e = 2 * self._s(
-            self.Omega_R) if gamma_e is None else gamma_e
-        self.gamma_a = 2 * self._s(
-            -self.Omega_R) if gamma_a is None else gamma_a
-        self.Gamma_e = 2 * self._s(
-            self.Omega_R/2) if Gamma_e is None else Gamma_e
-        self.Gamma_a = 2 * self._s(
-            -self.Omega_R/2) if Gamma_a is None else Gamma_a
-        self.gamma_phi = 2 * self._s(0) if gamma_phi is None else gamma_phi
+        self.gamma_e = self._set_gamma(gamma_e, self.Omega_R)
+        self.gamma_a = self._set_gamma(gamma_a, -self.Omega_R)
+        self.Gamma_e = self._set_gamma(Gamma_e, self.Omega_R/2)
+        self.Gamma_a = self._set_gamma(Gamma_a, -self.Omega_R/2)
+        self.gamma_phi = self._set_gamma(gamma_phi, 0)
 
         # Important vectors
-        self.bright = self._bright()  # bright state
-        self.polar_plus = 1/sqrt(2) * (
-            self.ms.creator_a * self.ms.vac + self.bright)
-        self.polar_minus = 1/sqrt(2) * (
-            self.ms.creator_a * self.ms.vac - self.bright)
-
-    def _j(self, omega):
-        return self._eta * omega * exp(-(omega/self._omega_cut)**2)
-
-    def _n(self, omega):
-        return (exp(omega * self._beta) - 1)**(-1)
-
-    def _s(self, omega):
-        if omega < 0:
-            return pi * self._j(-omega) * self._n(-omega)
-        elif omega > 0:
-            return pi * self._j(omega) * (1 + self._n(omega))
-        else:
-            return pi * self._eta / self._beta
+        self.VAC = self.ms.vac()
+        self.B = self._bright()  # bright state
+        self.UP = 1/sqrt(2) * (self._a * self.VAC + self.B)
+        self.LP = 1/sqrt(2) * (self._a * self.VAC - self.B)
 
     def _proj_dark(self):
-        return self.ms.one - self.ms.proj([self.polar_plus, self.polar_minus])
-
-    def _dark_states(self):
-        dark_ham = self.h_s() * self._proj_dark()
-        dark_states = dark_ham.eigenstates()[1]
-        assert len(dark_states) == self.ms.n - 1
-        for d1 in dark_states:
-            assert d1 == d1.unit()
-            for d2 in dark_states:
-                assert d1.dag() * d2 == 0
-        return dark_states
+        return self._one - orthonormal_projection(
+            states=[self.UP, self.LP], zero_op=self._zero)
 
     def _bright(self):
         b = 0
@@ -207,35 +198,46 @@ class HamiltonianSystem:
             b += self.ms.creator_c(i) * self.ms.vac
         return b / sqrt(self.ms.n)
 
+    def _u_m_i(self, m, i):
+        m += 1
+        i += 1
+        return exp(1j * 2*pi * m * i / self.N) / sqrt(self.N)
+
+    def _dark_states0(self):
+        for i in range(self.N - 1):
+            di1 = self.ms.zero() * self.VAC
+            for m in range(self.N):
+                umi = self._u_m_i(m, i)
+                di1 += umi * self._b(m).dag() * self.VAC
+            yield di1
+
+    def _dark_states(self):
+        return orthonormal_basis(
+            states=self._dark_states0(), zero_op=self._zero)
+
     def h(self):
-        # return self.h_s()
-        # return self.h_s() + self.h_d()
-        # return self.h_phi() + self.h_d()
-        # return self.h_s() + self.h_d() + self.h_phi() + self.h_b()
-        return self.h_s() + self.h_d(0)
+        return self.h_s() + self.h_d() + self.h_phi() + self.h_b()
 
     def h_s(self):
-        """System Hamiltonian
+        """System Hamiltonian, in rotating wave approximation
         """
-        a = self.ms.annihilator_a  # Cavity annihilation operator
-        c = self.ms.annihilator_c  # Molecular annihilation operator
-        hs = self.omega_c * a.dag() * a
+        hs = self.omega_c * self._a.dag() * self._a
         for i in range(self.ms.n):
-            hs += self.omega_m * c(i).dag() * c(i)
-            hs += self.g * (a * c(i).dag() + a.dag() * c(i))
+            hs += self.omega_m * self._c(i).dag() * self._c(i)
+            hs += self.g * (
+                self._a * self._c(i).dag() + self._a.dag() * self._c(i))
         return hs
 
     def h_phi(self):
         """System-bath interaction Hamiltonian
         """
-        c = self.ms.annihilator_c  # Molecular annihilation operator
-        b = self.ms.annihilator_b  # Bath annihilation operator
         hphi = 0
-        for i in range(self.ms.n):
+        for i in range(self.N):
             hphi_n = 0
-            for k in range(self.ms.num_phonons):
-                hphi_n += self.lambda_k[k] * (b(k, i).dag() + b(k, i))
-            hphi += c(i).dag() * c(i) * hphi_n
+            for k in range(self.Np):
+                hphi_n += self.lambda_k[k] * (
+                    self._b(k, i).dag() + self._b(k, i))
+            hphi += self._c(i).dag() * self._c(i) * hphi_n
         return hphi
 
     def h_b(self):
@@ -246,26 +248,22 @@ class HamiltonianSystem:
         else:
             return self._h_b_ind()
 
-    def h_d(self, t):
+    def h_d(self):
         """Driving Hamiltonian
         """
-        a = self.ms.annihilator_a
-        hd1 = self.Omega_p * (exp(-1j * self.omega_d * t)) * a
-        return hd1 + hd1.dag()
+        return self.Omega_p * (self._a + self._a.dag())
 
     def _h_b_com(self):
         hb = 0
-        b = self.ms.annihilator_b
-        for k in range(self.ms.num_phonons):
-            hb += self.omega_k[k] * b(k).dag() * b(k)
+        for k in range(self.Np):
+            hb += self.omega_k[k] * self._b(k).dag() * self._b(k)
         return hb
 
     def _h_b_ind(self):
         hb = 0
-        b = self.ms.annihilator_b
-        for k in range(self.ms.num_phonons):
-            for i in range(self.ms.n):
-                hb += self.omega_k[k] * b(k, i).dag() * b(k, i)
+        for k in range(self.Np):
+            for i in range(self.N):
+                hb += self.omega_k[k] * self._b(k, i).dag() * self._b(k, i)
         return hb
 
     def c_ops(self):
@@ -277,32 +275,29 @@ class HamiltonianSystem:
             return self._c_ops_ind()
 
     def _c_ops_com(self):
-        sig = self.ms.sigma
+        sig = _outer_product
         d = self._proj_dark()
-        pp = self.polar_plus
-        pm = self.polar_minus
         return [
-            sqrt(self.gamma_a/4) * sig(pp, pm),
-            sqrt(self.gamma_e/4) * sig(pm, pp),
-            sqrt(self.gamma_phi/4) * sig(pp, pp),
-            sqrt(self.gamma_phi/4) * sig(pm, pm),
-            sqrt(self.gamma_phi**2/4) * d,
-            sqrt(self._kappa) * self.ms.annihilator_a,
+            sqrt(self.gamma_a/4) * sig(self.UP, self.LP),
+            sqrt(self.gamma_e/4) * sig(self.LP, self.UP),
+            sqrt(self.gamma_phi/4) * sig(self.UP),
+            sqrt(self.gamma_phi/4) * sig(self.LP),
+            sqrt(self.gamma_phi) * d,
+            sqrt(self.kappa) * self._a
         ]
 
     def _c_ops_ind(self):
-        sig = self.ms.sigma
-        pp = self.polar_plus
-        pm = self.polar_minus
+        sig = _outer_product
         projd = self._proj_dark()
-        c = self.ms.annihilator_c
-        n = self.ms.n
+        n = self.N
+        pp = self.UP
+        pm = self.LP
         cops = [
             sqrt(self.gamma_a/4/n) * sig(pp, pm),
             sqrt(self.gamma_e/4/n) * sig(pm, pp),
-            sqrt(self.gamma_phi/4/n) * sig(pp, pp),
-            sqrt(self.gamma_phi/4/n) * sig(pm, pm),
-            sqrt(self._kappa) * self.ms.annihilator_a
+            sqrt(self.gamma_phi/4/n) * sig(pp),
+            sqrt(self.gamma_phi/4/n) * sig(pm),
+            sqrt(self.kappa) * self._a
         ]
         for d in self._dark_states():
             sop1 = self.Gamma_a / 4 / n * (
@@ -326,6 +321,15 @@ class HamiltonianSystem:
             )
         for i in range(n):
             cops.append(
-                sqrt(self.gamma_phi) * (projd * c(i).dag() * c(i) * projd)
+                sqrt(self.gamma_phi) * (
+                    projd * self._c(i).dag() * self._c(i) * projd)
             )
         return cops
+
+    def _set_gamma(self, param, omega=None):
+        if param is not None:
+            return param
+        elif omega is not None and self._S_func is not None:
+            return 2 * self._S_func(omega)
+        else:
+            return 0
